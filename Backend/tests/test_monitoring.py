@@ -1,6 +1,8 @@
+import importlib
 import unittest
 
 from Backend.app.health_engine import calculate_health_score
+from Backend.app.routes import monitoring as monitoring_routes
 from Backend.app.trend_engine import evaluate_trend
 from Backend.app.rul_engine import calculate_rul
 
@@ -22,6 +24,11 @@ class MonitoringEngineTests(unittest.TestCase):
     def test_rul_is_positive(self):
         rul = calculate_rul(35, 0.9, "CRITICAL")
         self.assertGreater(rul, 0)
+
+    def test_monitoring_loop_starts_only_when_requested(self):
+        module = importlib.reload(monitoring_routes)
+        self.assertTrue(callable(getattr(module, "start_monitoring_loop", None)))
+        self.assertFalse(module.is_monitoring_loop_running())
 
 
 if __name__ == "__main__":

@@ -1,14 +1,137 @@
 import os
+import warnings
 from pathlib import Path
 
+import joblib
+import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
+from sklearn.exceptions import InconsistentVersionWarning
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATASET_PATH = PROJECT_ROOT / "Dataset" / "Astra_Case.csv"
+DATASET_PATH = PROJECT_ROOT / "Dataset" / "Astra_Case_cleaned.csv"
+if not DATASET_PATH.exists():
+    DATASET_PATH = PROJECT_ROOT / "Dataset" / "Astra_Case.csv"
 SQLITE_DB_PATH = PROJECT_ROOT / "Backend" / "app" / "predictive_maintenance.db"
 DEFAULT_POSTGRES_URL = "postgresql://postgres:sqlpresuniv03@localhost:5432/Final_Project"
 DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_POSTGRES_URL)
+
+# Model features expected by the trained RandomForest
+MODEL_FEATURES = [
+    "air_temperature",
+    "process_temperature",
+    "rotational_speed",
+    "torque",
+    "tool_wear",
+    "pressure",
+    "vibration",
+    "electrical_current",
+]
+
+
+def _load_ml_model():
+    """Load the trained ML model for failure probability prediction."""
+    model_path = PROJECT_ROOT / "saved_models" / "maintenance_model.pkl"
+    if not model_path.exists():
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", InconsistentVersionWarning)
+            model = joblib.load(model_path)
+            if hasattr(model, "predict_proba"):
+                return model
+            return None
+    except Exception:
+        return None
+
+
+_ML_MODEL = None
+
+
+def _get_ml_model():
+    global _ML_MODEL
+    if _ML_MODEL is None:
+        _ML_MODEL = _load_ml_model()
+    return _ML_MODEL
+
+
+def _compute_health_score(row):
+    """Compute health score (0-100) from sensor data using heuristic formula."""
+    temp = row.get("air_temperature", 300)
+    process_temp = row.get("process_temperature", 310)
+    vibration = row.get("vibration", 0)
+    current = row.get("electrical_current", 0)
+    pressure = row.get("pressure", 0)
+    rotational_speed = row.get("rotational_speed", 1500)
+    torque = row.get("torque", 0)
+
+    temp_component = max(0, 100 - abs(temp - 300) * 0.5)
+    process_temp_component = max(0, 100 - abs(process_temp - 310) * 0.5)
+    vib_component = max(0, 100 - vibration * 15)
+    current_component = max(0, 100 - abs(current - 10) * 2)
+    pressure_component = max(0, 100 - abs(pressure - 6) * 5)
+    speed_component = max(0, 100 - abs(rotational_speed - 1500) * 0.02)
+    torque_component = max(0, 100 - torque * 1.5)
+
+    score = (
+        temp_component * 0.15
+        + process_temp_component * 0.10
+        + vib_component * 0.25
+        + current_component * 0.15
+        + pressure_component * 0.10
+        + speed_component * 0.10
+        + torque_component * 0.15
+    )
+    return round(max(0, min(100, score)), 2)
+
+
+def _compute_failure_probability(row):
+    """Compute failure probability using the ML model or heuristic fallback."""
+    model = _get_ml_model()
+    if model is not None:
+        try:
+            features = np.array([[row.get(f, 0) for f in MODEL_FEATURES]])
+            prob = float(model.predict_proba(features)[0][1])
+            return round(prob, 4)
+        except Exception:
+            pass
+
+    # Heuristic fallback if model unavailable
+    score = 0.0
+    temp = row.get("air_temperature", 300)
+    if temp > 305:
+        score += 0.1
+    if row.get("vibration", 0) > 2:
+        score += 0.2
+    if row.get("electrical_current", 0) > 12:
+        score += 0.15
+    if row.get("tool_wear", 0) > 200:
+        score += 0.15
+    if row.get("torque", 0) > 50:
+        score += 0.1
+    failure = row.get("machine_failure", 0)
+    if failure == 1:
+        score += 0.3
+    return round(min(score, 1.0), 4)
+
+
+def _risk_level_from_probability(prob):
+    if prob >= 0.80:
+        return "CRITICAL"
+    if prob >= 0.60:
+        return "HIGH"
+    if prob >= 0.35:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _compute_rul(row):
+    """Compute RUL from existing dataset rul or estimate from health score."""
+    existing_rul = row.get("rul")
+    if existing_rul is not None and not (isinstance(existing_rul, float) and np.isnan(existing_rul)):
+        return float(existing_rul)
+    health = _compute_health_score(row)
+    return round(health * 0.3, 1)
 
 
 def _build_postgres_engine():
@@ -54,28 +177,57 @@ def load_dashboard_data():
 
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
-    for column in ["product_id", "type", "motor_id"]:
-        if column not in df.columns and "product_id" in df.columns:
-            df["motor_id"] = df["product_id"]
 
-    if "motor_id" not in df.columns and "product_id" in df.columns:
-        df["motor_id"] = df["product_id"]
+    # Ensure motor_id is present
     if "motor_id" not in df.columns:
-        df["motor_id"] = [f"M{i:03d}" for i in range(1, len(df) + 1)]
+        if "product_id" in df.columns:
+            df["motor_id"] = df["product_id"].astype(str)
+        else:
+            df["motor_id"] = [f"M{i:03d}" for i in range(1, len(df) + 1)]
+    else:
+        df["motor_id"] = df["motor_id"].astype(str)
 
-    rename_map = {
-        "product_id": "product_id",
-        "type": "type",
-        "rotational_speed": "rotation_speed",
-        "electrical_current": "electrical_current",
-        "air_temperature": "air_temperature",
-        "process_temperature": "process_temperature",
-        "tool_wear": "tool_wear",
-        "machine_failure": "machine_failure",
-        "rul": "rul",
-    }
-    for old_name, new_name in rename_map.items():
-        if old_name in df.columns and new_name not in df.columns:
-            df[new_name] = df[old_name]
+    # Map rotational_speed if needed
+    if "rotation_speed" not in df.columns and "rotational_speed" in df.columns:
+        df["rotation_speed"] = df["rotational_speed"]
+
+    # Compute derived health metrics for each row
+    health_scores = []
+    failure_probs = []
+    risk_levels = []
+    ruls = []
+
+    for _, row in df.iterrows():
+        hs = _compute_health_score(row)
+        fp = _compute_failure_probability(row)
+        rl = _risk_level_from_probability(fp)
+        rul_val = _compute_rul(row)
+        health_scores.append(hs)
+        failure_probs.append(fp)
+        risk_levels.append(rl)
+        ruls.append(rul_val)
+
+    df["health_score"] = health_scores
+    df["failure_probability"] = failure_probs
+    df["risk_level"] = risk_levels
+    df["rul"] = ruls
+
+    # Status column
+    def _status(rl, mf):
+        if mf == 1 or rl == "CRITICAL":
+            return "Critical"
+        if rl == "HIGH":
+            return "Warning"
+        if rl == "MEDIUM":
+            return "Attention"
+        return "Normal"
+
+    df["status"] = df.apply(
+        lambda row: _status(
+            row["risk_level"],
+            row.get("machine_failure", 0),
+        ),
+        axis=1,
+    )
 
     return df, source

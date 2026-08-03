@@ -1,7 +1,16 @@
-import sys
-from pathlib import Path
+"""
+AI-Powered Predictive Maintenance Platform for Induction Motor Failure
+Main Dashboard (Home Page)
 
-import numpy as np
+Astra Otoparts - Enterprise Predictive Maintenance Platform
+"""
+import sys
+import time
+from copy import deepcopy
+from datetime import datetime, timedelta
+from pathlib import Path
+from statistics import mean
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -10,249 +19,757 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from Backend.app.health_engine import calculate_health_score
-from Backend.app.models.ml_model import model
-from Frontend.utils.db_connection import load_dashboard_data
+from Frontend.utils.prediction import (
+    risk_level, degradation_level, failure_label, maintenance_window,
+    dominant_signals, recommendation, estimate_realtime_failure_probability
+)
+from Frontend.utils.helper import (
+    LONG_WINDOW, ALERT_COOLDOWN_SECONDS, ALL_RISK_LEVELS,
+    get_dataset_machine_ids, init_session_state, load_cleaned_dataset
+)
+from Frontend.utils.charts import gauge_chart
+from Frontend.utils.components import (
+    hero_card, metric_card, section_card, empty_state,
+    status_badge, asset_card, alert_banner
+)
+from Frontend.utils.simulation_loop import (
+    update_one_cycle, analyze_periodic, check_realtime_alert,
+    latest_record, latest_feature, latest_report, latest_alert,
+    make_machine_summary_df, get_machine_history_df
+)
 
-st.set_page_config(page_title="WINTEQ | Astra Otoparts Bootcamp Briefing", page_icon="⚙️", layout="wide")
+# =========================================================
+# PAGE CONFIG
+# =========================================================
+st.set_page_config(
+    page_title="Astra Otoparts - Predictive Maintenance Platform",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-CSS_PATH = Path(__file__).resolve().parent / "styles" / "streamlit.css"
-if CSS_PATH.exists():
-    st.markdown(f"<style>{CSS_PATH.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
-
-
-def build_dashboard_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
-    df = raw_df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-
-    for col in [
-        "air_temperature",
-        "process_temperature",
-        "rotation_speed",
-        "torque",
-        "tool_wear",
-        "pressure",
-        "vibration",
-        "electrical_current",
-    ]:
-        if col not in df.columns:
-            df[col] = np.nan
-
-    if "product_id" in df.columns and "motor_id" not in df.columns:
-        df["motor_id"] = df["product_id"]
-    if "motor_id" not in df.columns:
-        df["motor_id"] = [f"M{i:03d}" for i in range(1, len(df) + 1)]
-    if "type" not in df.columns:
-        df["type"] = "INDUCTION"
-
-    feature_cols = [
-        "air_temperature",
-        "process_temperature",
-        "rotation_speed",
-        "torque",
-        "tool_wear",
-        "pressure",
-        "vibration",
-        "electrical_current",
-    ]
-    feature_frame = df[feature_cols].copy().fillna(0)
-
+# =========================================================
+# LOAD CUSTOM CSS
+# =========================================================
+def load_custom_css():
+    css_path = PROJECT_ROOT / "Frontend" / "styles" / "streamlit.css"
     try:
-        probs = model.predict_proba(feature_frame)[:, 1]
+        if css_path.exists():
+            css = css_path.read_text(encoding="utf-8")
+            st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
     except Exception:
-        probs = np.zeros(len(df))
+        pass
 
-    df["failure_probability"] = np.clip(probs, 0.0, 1.0)
-    df["health_score"] = [
-        calculate_health_score(
-            row.get("air_temperature", 0),
-            row.get("vibration", 0),
-            row.get("electrical_current", 0),
-            row.get("pressure", 0),
-            row.get("rotation_speed", 0),
+load_custom_css()
+
+# =========================================================
+# GET MACHINE IDS
+# =========================================================
+MACHINE_IDS = get_dataset_machine_ids() or []
+if not MACHINE_IDS:
+    st.warning(
+        "No product_id values found in dataset. The 'Select motor' dropdown "
+        "may be empty. Please check the 'product_id' column and CSV format."
+    )
+
+# =========================================================
+# INIT SESSION STATE
+# =========================================================
+init_session_state(MACHINE_IDS)
+
+# =========================================================
+# DATASET INSPECTION
+# =========================================================
+
+def show_dataset_inspection(df, filename):
+    """Display dataset inspection section (preserved from original)."""
+    container = st.container()
+    with container:
+        st.markdown('<div class="section-card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title"><span class="title-accent"></span> Dataset Inspection & Visualization</div>', unsafe_allow_html=True)
+
+        col1, col2, col3, col4 = st.columns(4)
+        duplicate_count = int(df.duplicated().sum())
+        missing_count = int(df.isna().sum().sum())
+        product_count = int(df["product_id"].nunique()) if "product_id" in df.columns else "N/A"
+        failure_rate = float(df["machine_failure"].mean() * 100) if "machine_failure" in df.columns else None
+
+        col1.metric("Dataset file", filename)
+        col2.metric("Total rows", len(df))
+        col3.metric("Duplicate rows", duplicate_count)
+        col4.metric("Missing values", missing_count)
+
+        extra1, extra2, extra3, extra4 = st.columns(4)
+        extra1.metric("Unique products", product_count)
+        if failure_rate is not None:
+            extra2.metric("Failure rate", f"{failure_rate:.2f}%")
+        else:
+            extra2.metric("Failure rate", "N/A")
+        extra3.metric("Columns", len(df.columns))
+        extra4.metric("Sample rows", 10)
+
+        if duplicate_count > 0 or missing_count > 0:
+            st.warning("Dataset has duplicates or missing values. Please inspect and clean if necessary.")
+        else:
+            st.success("Dataset is clean of duplicates and missing values.")
+
+        st.markdown("### Statistics Summary")
+        numeric_cols = [c for c in df.columns if df[c].dtype.kind in "biufc"]
+        st.dataframe(
+            df[numeric_cols].describe().T.reset_index().rename(columns={"index": "feature"}),
+            use_container_width=True,
         )
-        for _, row in df.iterrows()
-    ]
-    df["health_score"] = pd.to_numeric(df["health_score"], errors="coerce").fillna(0)
 
-    if "rul" in df.columns:
-        df["rul"] = pd.to_numeric(df["rul"], errors="coerce").fillna(0)
+        st.markdown("### Main Visualizations")
+        chart_cols = ["air_temperature", "process_temperature", "tool_wear", "vibration"]
+        row1, row2 = st.columns(2)
+        with row1:
+            if "air_temperature" in df.columns and "process_temperature" in df.columns:
+                fig = px.scatter(
+                    df, x="air_temperature", y="process_temperature",
+                    color="machine_failure" if "machine_failure" in df.columns else None,
+                    title="Air Temperature vs Process Temperature", opacity=0.8,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            if "tool_wear" in df.columns:
+                fig = px.histogram(df, x="tool_wear", nbins=30, title="Tool Wear Distribution")
+                st.plotly_chart(fig, use_container_width=True)
+        with row2:
+            if "air_temperature" in df.columns:
+                fig = px.histogram(df, x="air_temperature", nbins=30, title="Air Temperature Distribution")
+                st.plotly_chart(fig, use_container_width=True)
+            if "machine_failure" in df.columns:
+                failure_counts = df["machine_failure"].value_counts().reset_index()
+                failure_counts.columns = ["machine_failure", "count"]
+                fig = px.bar(
+                    failure_counts, x="machine_failure", y="count",
+                    title="Machine Failure Distribution",
+                    labels={"machine_failure": "Failure", "count": "Count"},
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+        if "type" in df.columns:
+            st.markdown("### Product Type Distribution")
+            type_counts = df["type"].value_counts().reset_index()
+            type_counts.columns = ["type", "count"]
+            fig = px.bar(type_counts, x="type", y="count", title="Count Per Product Type", text_auto=True)
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### Sample Data")
+        st.dataframe(df.head(10), use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
+# =========================================================
+# INITIAL SEED
+# =========================================================
+if "seeded" not in st.session_state:
+    for _ in range(3):
+        update_one_cycle()
+    st.session_state.seeded = True
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+
+with st.sidebar:
+    # Company Logo / Brand
+    st.markdown(
+        """
+        <div class="sidebar-logo">
+            <div class="sidebar-logo-text">Astra Otoparts</div>
+            <div class="sidebar-logo-sub">Predictive Maintenance Platform</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Navigation
+    st.markdown('<div class="sidebar-section-title">Navigation</div>', unsafe_allow_html=True)
+
+    st.page_link("app.py", label="Dashboard", use_container_width=True)
+    st.page_link("pages/1_Sensor_Monitoring.py", label="Sensor Monitoring", use_container_width=True)
+    st.page_link("pages/2_Machine_Prediction.py", label="Machine Prediction", use_container_width=True)
+    st.page_link("pages/3_Machines.py", label="Machines", use_container_width=True)
+    st.page_link("pages/4_Alerts.py", label="Alerts", use_container_width=True)
+    st.page_link("pages/5_Maintenance.py", label="Maintenance", use_container_width=True)
+    st.page_link("pages/6_Reports.py", label="Reports", use_container_width=True)
+    st.page_link("pages/7_Settings.py", label="Settings", use_container_width=True)
+    st.page_link("pages/8_About.py", label="About", use_container_width=True)
+
+    st.markdown("---")
+
+    # Control Panel
+    st.markdown('<div class="sidebar-section-title">Control Panel</div>', unsafe_allow_html=True)
+
+    col_start, col_stop = st.columns(2)
+    with col_start:
+        if st.button("▶ Start", use_container_width=True):
+            st.session_state.running = True
+    with col_stop:
+        if st.button("⏹ Stop", use_container_width=True):
+            st.session_state.running = False
+
+    col_gen, col_reset = st.columns(2)
+    with col_gen:
+        if st.button("⚡ 1 Cycle", use_container_width=True):
+            update_one_cycle()
+    with col_reset:
+        if st.button("↺ Reset", use_container_width=True):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+
+    st.markdown("---")
+
+    # Threshold Settings
+    with st.expander("Threshold Settings", expanded=False):
+        for param, levels in st.session_state.thresholds.items():
+            for level, value in levels.items():
+                step = 0.1 if "warning" in level or "critical" in level else 1.0
+                new_value = st.number_input(
+                    f"{param} {level}",
+                    value=float(value),
+                    step=step,
+                    key=f"side_{param}_{level}",
+                )
+                st.session_state.thresholds[param][level] = new_value
+
+    st.markdown("---")
+
+    # Filters
+    st.markdown('<div class="sidebar-section-title">Filters</div>', unsafe_allow_html=True)
+    selected_machines = st.multiselect(
+        "Filter by motor", options=MACHINE_IDS, default=MACHINE_IDS,
+        key="sidebar_machine_filter"
+    )
+    selected_risk_levels = st.multiselect(
+        "Filter by risk level", options=ALL_RISK_LEVELS, default=ALL_RISK_LEVELS,
+        key="sidebar_risk_filter"
+    )
+    show_auto_refresh = st.checkbox("Auto refresh", value=True, key="sidebar_autorefresh")
+    st.session_state.auto_refresh = show_auto_refresh
+
+    available_machines = [m for m in selected_machines] if selected_machines else MACHINE_IDS
+    if not available_machines:
+        available_machines = MACHINE_IDS
+    selected_machine = st.selectbox(
+        "Select motor", available_machines, index=0,
+        key="sidebar_motor_select"
+    )
+    st.session_state.selected_machine = selected_machine
+
+    st.markdown("---")
+
+    # CSV Export
+    history_export_df = []
+    for machine_id in available_machines:
+        records = list(st.session_state.machine_data[machine_id]["records"])
+        if records:
+            history_export_df.extend(records)
+
+    if history_export_df:
+        export_df = pd.DataFrame(history_export_df)
+        csv_data = export_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Export CSV",
+            data=csv_data,
+            file_name="motor_history.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
     else:
-        df["rul"] = np.maximum(50, 1000 - (df["failure_probability"] * 700)).astype(int)
+        st.info("No historical data yet.")
 
-    df["risk_level"] = np.select(
-        [df["failure_probability"] >= 0.8, df["failure_probability"] >= 0.6, df["failure_probability"] >= 0.35],
-        ["CRITICAL", "HIGH", "MEDIUM"],
-        default="LOW",
-    )
-    df["status"] = np.select(
-        [df["rul"] <= 180, df["rul"] <= 420],
-        ["Critical", "Warning"],
-        default="Healthy",
-    )
-    df["maintenance_recommendation"] = df.apply(
-        lambda row: (
-            "Immediate shutdown and inspection"
-            if row["failure_probability"] >= 0.8
-            else "Schedule predictive maintenance within 24 hours"
-            if row["failure_probability"] >= 0.6
-            else "Continue routine monitoring"
-        ),
-        axis=1,
-    )
-    return df
+    # Dataset Inspection Toggle
+    st.markdown("---")
+    show_dataset = st.checkbox("Show Dataset Inspection", value=True, key="sidebar_show_dataset")
 
+# =========================================================
+# RUN SIMULATION IF ACTIVE
+# =========================================================
+if st.session_state.running:
+    update_one_cycle()
 
-@st.cache_data(show_spinner=False)
-def load_view_data():
-    raw_df, source = load_dashboard_data()
-    frame = build_dashboard_frame(raw_df)
-    return frame, source
+# =========================================================
+# MAIN DASHBOARD CONTENT
+# =========================================================
 
-
-frame, source = load_view_data()
-
-if frame.empty:
-    st.error("No data is available to display.")
-    st.stop()
+# --- HEADER / HERO ---
+hero_status = "success"
+hero_msg = "All systems operating normally"
+recent_alerts = [
+    a for a in st.session_state.alert_log
+    if a["machine_id"] in available_machines and a["alert_level"] in selected_risk_levels
+]
+if recent_alerts:
+    top_alert = recent_alerts[0]
+    hero_msg = f"Alert: {top_alert['machine_id']} - {top_alert['alert_level']} (Failure Prob: {top_alert['failure_probability']*100:.2f}%)"
+    hero_status = "error"
 
 st.markdown(
-    """
+    f"""
     <div class="hero-card">
-        <div class="hero-title">WINTEQ | ASTRA OTOPARTS BOOTCAMP BRIEFING</div>
-        <div class="hero-subtitle">July 2026 · Engineering Solution Center · Industrial Intelligence and Flexible Automation</div>
-        <div class="hero-badges">
-            <span class="badge badge-green">Data Source: {source}</span>
-            <span class="badge badge-yellow">AI-driven platform</span>
-            <span class="badge badge-red">Enterprise-ready</span>
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap;">
+            <div>
+                <div class="hero-title">Predictive Maintenance Dashboard</div>
+                <div class="hero-subtitle">Multi-parameter monitoring and predictive analysis for induction motors | Temperature, Vibration, Current, Pressure, Voltage, RPM</div>
+                <div class="hero-badges">
+                    <span class="hero-badge green">● System Online</span>
+                    <span class="hero-badge blue">● {len(available_machines)} Motors Active</span>
+                    {"<span class='hero-badge yellow'>● Warnings Active</span>" if any(a['alert_level']=='WARNING' for a in recent_alerts) else ""}
+                    {"<span class='hero-badge red'>● Critical Alerts</span>" if any(a['alert_level']=='CRITICAL' for a in recent_alerts) else ""}
+                </div>
+            </div>
+            <div style="text-align:right;">
+                <div style="color:#64748b;font-size:0.75rem;">{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+                <div style="color:#94a3b8;font-size:0.7rem;">Live Monitoring</div>
+            </div>
         </div>
     </div>
-    """.format(source=source.upper()),
+    """,
     unsafe_allow_html=True,
 )
 
-with st.sidebar:
-    st.markdown("<div class='sidebar-card'><div class='section-title'>Control Center</div><div class='asset-text'>Filter the operating dataset and focus on the relevant use case.</div></div>", unsafe_allow_html=True)
-
-    type_options = sorted(frame["type"].dropna().astype(str).unique().tolist()) if "type" in frame.columns else []
-    selected_types = st.multiselect("Filter Motor Type", options=type_options, default=type_options)
-    if selected_types:
-        frame = frame[frame["type"].astype(str).isin(selected_types)].copy()
-
-    st.markdown("---")
-    st.metric("Motors loaded", len(frame))
-    st.metric("Average health", f"{frame['health_score'].mean():.1f}")
-    st.metric("Average failure probability", f"{frame['failure_probability'].mean() * 100:.1f}%")
-    st.metric("Critical risk", int((frame["risk_level"] == "CRITICAL").sum()))
-
-    st.markdown("---")
-    st.info("When PostgreSQL is unavailable, the system automatically uses the local CSV and SQLite fallback.")
-
-if frame.empty:
-    st.warning("No records match the current filter.")
-    st.stop()
-
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.markdown(f"<div class='metric-card'><div class='metric-title'>Total motors</div><div class='metric-value'>{len(frame)}</div><div class='metric-sub'>Assets in view</div></div>", unsafe_allow_html=True)
-with col2:
-    st.markdown(f"<div class='metric-card'><div class='metric-title'>Fleet health</div><div class='metric-value'>{frame['health_score'].mean():.1f}</div><div class='metric-sub'>Condition index</div></div>", unsafe_allow_html=True)
-with col3:
-    st.markdown(f"<div class='metric-card'><div class='metric-title'>Failure probability</div><div class='metric-value'>{frame['failure_probability'].mean() * 100:.1f}%</div><div class='metric-sub'>Estimated risk exposure</div></div>", unsafe_allow_html=True)
-with col4:
-    st.markdown(f"<div class='metric-card'><div class='metric-title'>Critical risk</div><div class='metric-value'>{int((frame['risk_level'] == 'CRITICAL').sum())}</div><div class='metric-sub'>Priority actions</div></div>", unsafe_allow_html=True)
-
-st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-st.markdown("<div class='section-title'>Executive Overview</div>", unsafe_allow_html=True)
-left, right = st.columns([1.25, 0.9])
-
-with left:
-    fig_health = px.scatter(
-        frame,
-        x="rotation_speed" if "rotation_speed" in frame.columns else "air_temperature",
-        y="health_score",
-        color="risk_level",
-        size="failure_probability",
-        hover_data=["motor_id", "type", "rul", "failure_probability"],
-        title="Asset Condition vs Operating Profile"
+# Alert banner
+if recent_alerts:
+    top_alert = recent_alerts[0]
+    st.error(
+        f"🚨 REALTIME ALERT | {top_alert['machine_id']} | Level: {top_alert['alert_level']} | "
+        f"Failure Probability: {top_alert['failure_probability'] * 100:.2f}% | {top_alert['conclusion']}"
     )
-    fig_health.update_layout(template="plotly_dark", margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(fig_health, use_container_width=True)
+else:
+    st.success("✅ No critical alert at the moment.")
 
-with right:
-    critical_assets = frame.sort_values("failure_probability", ascending=False).head(6)
-    st.markdown("<div class='section-title' style='font-size:16px'>Critical Attention</div>", unsafe_allow_html=True)
-    for _, row in critical_assets.iterrows():
+# --- TOP KPI ROW ---
+summary_df = make_machine_summary_df(available_machines)
+
+kpi_cols = st.columns(5)
+if not summary_df.empty:
+    machine_count = len(summary_df)
+    healthy_count = len(summary_df[summary_df["Health Score"] >= 75]) if "Health Score" in summary_df.columns else 0
+    warning_count = len(summary_df[(summary_df["Health Score"] >= 50) & (summary_df["Health Score"] < 75)]) if "Health Score" in summary_df.columns else 0
+    critical_count = len(summary_df[summary_df["Health Score"] < 50]) if "Health Score" in summary_df.columns else 0
+    failure_count = len(summary_df[summary_df["Realtime Failure Prob (%)"] >= 80])
+
+    with kpi_cols[0]:
         st.markdown(
-            f"<div class='asset-card'><div class='asset-title'>{row['motor_id']}</div><div class='asset-text'>Risk: {row['risk_level']} · RUL: {int(row['rul'])} · {row['maintenance_recommendation']}</div></div>",
-            unsafe_allow_html=True,
+            f"""
+            <div class="metric-card healthy">
+                <div class="metric-title">Total Machines</div>
+                <div class="metric-value">{machine_count}</div>
+                <div class="metric-sub">Monitored assets</div>
+            </div>
+            """, unsafe_allow_html=True
+        )
+    with kpi_cols[1]:
+        st.markdown(
+            f"""
+            <div class="metric-card healthy">
+                <div class="metric-title">Healthy</div>
+                <div class="metric-value">{healthy_count}</div>
+                <div class="metric-sub">≥ 75 Health Score</div>
+            </div>
+            """, unsafe_allow_html=True
+        )
+    with kpi_cols[2]:
+        st.markdown(
+            f"""
+            <div class="metric-card warning">
+                <div class="metric-title">Warning</div>
+                <div class="metric-value">{warning_count}</div>
+                <div class="metric-sub">50-74 Health Score</div>
+            </div>
+            """, unsafe_allow_html=True
+        )
+    with kpi_cols[3]:
+        st.markdown(
+            f"""
+            <div class="metric-card critical">
+                <div class="metric-title">Critical</div>
+                <div class="metric-value">{critical_count}</div>
+                <div class="metric-sub">{"< 50 Health Score"}</div>
+            </div>
+            """, unsafe_allow_html=True
+        )
+    with kpi_cols[4]:
+        st.markdown(
+            f"""
+            <div class="metric-card critical">
+                <div class="metric-title">Failure Risk</div>
+                <div class="metric-value">{failure_count}</div>
+                <div class="metric-sub">≥ 80% Probability</div>
+            </div>
+            """, unsafe_allow_html=True
+        )
+else:
+    for idx, (label, sub) in enumerate([("Total Machines", "Monitored assets"), ("Healthy", "≥ 75 Score"),
+                                          ("Warning", "50-74 Score"), ("Critical", "< 50 Score"),
+                                          ("Failure Risk", "≥ 80% Prob")]):
+        with kpi_cols[idx]:
+            st.markdown(
+                f"""
+                <div class="metric-card info">
+                    <div class="metric-title">{label}</div>
+                    <div class="metric-value">0</div>
+                    <div class="metric-sub">{sub}</div>
+                </div>
+                """, unsafe_allow_html=True
+            )
+
+# --- SECOND ROW: GAUGES & DISTRIBUTION ---
+st.markdown('<div class="section-card">', unsafe_allow_html=True)
+st.markdown('<div class="section-title"><span class="title-accent"></span> System Health Overview</div>', unsafe_allow_html=True)
+
+gauge_cols = st.columns(4)
+if not summary_df.empty and selected_machine:
+    record = latest_record(selected_machine)
+    feature = latest_feature(selected_machine)
+    report = latest_report(selected_machine)
+
+    if record and feature:
+        realtime_fp = estimate_realtime_failure_probability(feature)
+        health_score = report["health_score"] if report else 0
+
+        with gauge_cols[0]:
+            st.plotly_chart(gauge_chart(health_score, "Health Score", 100), use_container_width=True, key="dashboard_health_gauge")
+        with gauge_cols[1]:
+            st.plotly_chart(
+                gauge_chart(realtime_fp * 100, "Failure Probability", 100, "%"),
+                use_container_width=True,
+                key="dashboard_failure_gauge"
+            )
+        with gauge_cols[2]:
+            rul_value = report["output_3_action_plan"]["maintenance_window"] if report else "N/A"
+            if isinstance(rul_value, str):
+                st.markdown(
+                    f"""
+                    <div class="metric-card info" style="text-align:center;padding:2rem 1rem;">
+                        <div class="metric-title">Remaining Useful Life</div>
+                        <div style="font-size:1.2rem;font-weight:700;color:#f8fafc;margin-top:0.5rem;">{rul_value}</div>
+                        <div class="metric-sub">Estimated maintenance window</div>
+                    </div>
+                    """, unsafe_allow_html=True
+                )
+        with gauge_cols[3]:
+            # Risk Distribution Pie
+            if not summary_df.empty and "Periodic Risk" in summary_df.columns:
+                risk_counts = summary_df["Periodic Risk"].value_counts().reset_index()
+                risk_counts.columns = ["Risk", "Count"]
+                fig = px.pie(
+                    risk_counts, names="Risk", values="Count",
+                    title="Risk Distribution",
+                    color_discrete_sequence=["#00ff88", "#ffd700", "#ff8c00", "#ff4444"],
+                )
+                fig.update_layout(
+                    height=220, margin=dict(l=10, r=10, t=30, b=10),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font={"color": "#cbd5e1", "size": 9},
+                    showlegend=True,
+                )
+                fig.update_traces(textposition="inside", textinfo="percent+label")
+                st.plotly_chart(fig, use_container_width=True, key="dashboard_risk_pie")
+st.markdown('</div>', unsafe_allow_html=True)
+
+# --- THIRD ROW: TOP RISK, HEALTH TREND, RECENT ALERTS ---
+row3_cols = st.columns([1, 1, 1])
+
+with row3_cols[0]:
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title"><span class="title-accent"></span> Top Risk Machines</div>', unsafe_allow_html=True)
+    if not summary_df.empty and "Realtime Failure Prob (%)" in summary_df.columns:
+        top_risk = summary_df.nlargest(5, "Realtime Failure Prob (%)")[
+            ["Machine", "Realtime Failure Prob (%)", "Health Score"]
+        ]
+        for _, row in top_risk.iterrows():
+            risk_pct = row["Realtime Failure Prob (%)"]
+            badge_class = "critical" if risk_pct >= 80 else "warning" if risk_pct >= 50 else "healthy"
+            st.markdown(
+                f"""
+                <div class="asset-card" style="border-left-color:{'#ff4444' if risk_pct>=80 else '#ffd700' if risk_pct>=50 else '#00ff88'};">
+                    <div class="asset-title">{row['Machine']}</div>
+                    <div class="asset-text">
+                        <span class="status-badge {badge_class}">{risk_pct:.1f}% Failure Prob</span>
+                        {' ' + str(row['Health Score']) if pd.notna(row['Health Score']) else ''}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True
+            )
+    else:
+        st.info("No data available.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with row3_cols[1]:
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title"><span class="title-accent"></span> Health Score Trend</div>', unsafe_allow_html=True)
+    if selected_machine:
+        history_df = get_machine_history_df(selected_machine)
+        if not history_df.empty:
+            history_df = history_df.copy()
+            history_df["timestamp"] = pd.to_datetime(history_df["timestamp"])
+            fig = px.line(
+                history_df, x="timestamp", y="temperature",
+                title="Temperature Trend",
+                color_discrete_sequence=["#3b82f6"],
+            )
+            fig.update_layout(
+                height=200, margin=dict(l=10, r=10, t=25, b=10),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font={"color": "#cbd5e1", "size": 10},
+                xaxis={"gridcolor": "rgba(148,163,184,0.1)", "zeroline": False},
+                yaxis={"gridcolor": "rgba(148,163,184,0.1)", "zeroline": False},
+                showlegend=False,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No trend data.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with row3_cols[2]:
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title"><span class="title-accent"></span> Recent Alerts</div>', unsafe_allow_html=True)
+    filtered_alerts = [
+        a for a in st.session_state.alert_log
+        if a["machine_id"] in available_machines and a["alert_level"] in selected_risk_levels
+    ]
+    if filtered_alerts:
+        for alert in filtered_alerts[:5]:
+            alert_class = "critical" if alert["alert_level"] == "CRITICAL" else "warning"
+            st.markdown(
+                f"""
+                <div class="asset-card" style="border-left-color:{'#ff4444' if alert['alert_level']=='CRITICAL' else '#ffd700'};">
+                    <div class="asset-title">{alert['machine_id']}</div>
+                    <div class="asset-text">
+                        <span class="status-badge {alert_class}">{alert['alert_level']}</span>
+                        {' ' + ' | '.join(alert['trigger_reasons'][:2])}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True
+            )
+    else:
+        st.success("No alerts for current filters.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# --- MACHINE SUMMARY TABLE ---
+st.markdown('<div class="section-card">', unsafe_allow_html=True)
+st.markdown('<div class="section-title"><span class="title-accent"></span> Real-Time Machine Summary</div>', unsafe_allow_html=True)
+if not summary_df.empty:
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+else:
+    st.info("No data available yet. Start monitoring or generate a cycle.")
+st.markdown('</div>', unsafe_allow_html=True)
+
+# --- MOTOR DETAIL SECTION ---
+st.markdown('<div class="section-card">', unsafe_allow_html=True)
+st.markdown(
+    f'<div class="section-title"><span class="title-accent"></span> Motor Detail: {selected_machine}</div>',
+    unsafe_allow_html=True,
+)
+
+record = latest_record(selected_machine)
+feature = latest_feature(selected_machine)
+report = latest_report(selected_machine)
+alert = latest_alert(selected_machine)
+
+if record is None or feature is None:
+    st.warning("No data available for this motor yet.")
+else:
+    realtime_fp = estimate_realtime_failure_probability(feature)
+    health_score = report["health_score"] if report else 0
+
+    # Gauges
+    g1, g2, g3 = st.columns(3)
+    with g1:
+        st.plotly_chart(gauge_chart(health_score, "Health Score", 100), use_container_width=True, key="motor_health_gauge")
+    with g2:
+        st.plotly_chart(
+            gauge_chart(realtime_fp * 100, "Failure Probability", 100, "%"),
+            use_container_width=True,
+            key="motor_failure_gauge"
+        )
+    with g3:
+        st.plotly_chart(
+            gauge_chart(feature["degradation_score"], "Degradation Score", 100),
+            use_container_width=True,
+            key="motor_degradation_gauge"
         )
 
-st.markdown("</div>", unsafe_allow_html=True)
+    # Sensor Snapshot
+    st.markdown("### Sensor Snapshot")
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Temperature", f"{record['temperature']} °C")
+    m2.metric("Vibration", f"{record['vibration']}")
+    m3.metric("Current", f"{record['current']} A")
+    m4.metric("Pressure", f"{record['pressure']}")
+    m5.metric("Voltage", f"{record['voltage']} V")
+    m6.metric("RPM", f"{record['rpm']}")
 
-st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-st.markdown("<div class='section-title'>Fleet Trend and Risk Distribution</div>", unsafe_allow_html=True)
-trend_col, risk_col = st.columns([1.25, 0.75])
+    # Analysis Outputs
+    st.markdown("### Analysis Outputs")
+    out1, out2, out3 = st.columns(3)
+    with out1:
+        st.markdown("##### 1) Health Summary")
+        if report:
+            st.json(report["output_1_health_summary"])
+        else:
+            st.info("Periodic report not available yet.")
+    with out2:
+        st.markdown("##### 2) Failure Estimation")
+        if report:
+            st.json(report["output_2_failure_estimation"])
+        else:
+            st.json({
+                "machine_id": selected_machine,
+                "realtime_failure_probability": round(realtime_fp, 4),
+                "estimated_status": failure_label(realtime_fp),
+                "anomaly_score": round(feature["anomaly_score"], 2),
+                "degradation_score": round(feature["degradation_score"], 2),
+            })
+    with out3:
+        st.markdown("##### 3) Action Plan")
+        if report:
+            st.json(report["output_3_action_plan"])
+        else:
+            temp_signals = dominant_signals(feature, st.session_state.thresholds)
+            temp_deg = degradation_level(feature["degradation_score"])
+            temp_rec = recommendation(feature, realtime_fp, temp_deg, temp_signals)
+            st.json({
+                "machine_id": selected_machine,
+                "priority": risk_level(realtime_fp),
+                "recommendation": temp_rec,
+                "maintenance_window": maintenance_window(realtime_fp),
+            })
 
-with trend_col:
-    trend_df = pd.DataFrame({
-        "index": range(min(20, len(frame))),
-        "health_score": frame.sort_values("health_score").head(min(20, len(frame))) ["health_score"].values if len(frame) > 0 else []
-    })
-    if not trend_df.empty:
-        fig_trend = px.line(trend_df, x="index", y="health_score", markers=True, title="Fleet Health Trend")
-        fig_trend.update_layout(template="plotly_dark", margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(fig_trend, use_container_width=True)
-
-with risk_col:
-    risk_summary = frame.groupby("risk_level").size().reset_index(name="count")
-    fig_risk = px.pie(risk_summary, names="risk_level", values="count", hole=0.5, title="Risk Distribution")
-    fig_risk.update_layout(template="plotly_dark", margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(fig_risk, use_container_width=True)
-
-st.markdown("</div>", unsafe_allow_html=True)
-
-analytics_tab, alerts_tab = st.tabs(["Use Cases", "Alert Intelligence"])
-
-with analytics_tab:
-    st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-    st.markdown("<div class='section-title'>Use Case 1: Camera AI - Dynamic Software</div>", unsafe_allow_html=True)
-    st.markdown("<div class='asset-text'>A modular and configuration-driven platform that enables rapid deployment of customer-specific machine vision workflows without routine code changes.</div>", unsafe_allow_html=True)
-    st.markdown("<div class='asset-text'>• Modular workflow architecture</div>", unsafe_allow_html=True)
-    st.markdown("<div class='asset-text'>• Configuration-driven setup</div>", unsafe_allow_html=True)
-    st.markdown("<div class='asset-text'>• Template management for multiple inspection scenarios</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-    st.markdown("<div class='section-title'>Use Case 2: Predictive Maintenance for Induction Motor Failure</div>", unsafe_allow_html=True)
-    st.markdown("<div class='asset-text'>An AI-based predictive maintenance solution that continuously learns from historical and real-time machine data to estimate failure risk and support proactive maintenance planning.</div>", unsafe_allow_html=True)
-    st.markdown("<div class='asset-text'>• Multi-parameter monitoring across temperature, vibration, current, pressure, and speed</div>", unsafe_allow_html=True)
-    st.markdown("<div class='asset-text'>• Remaining Useful Life estimation</div>", unsafe_allow_html=True)
-    st.markdown("<div class='asset-text'>• Real-time health scoring with maintenance recommendations</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with alerts_tab:
-    st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-    st.markdown("<div class='section-title'>Priority Recommendations</div>", unsafe_allow_html=True)
-    top_risk = frame.sort_values("failure_probability", ascending=False).head(8)
-    for _, row in top_risk.iterrows():
-        st.markdown(
-            f"<div class='asset-card'><div class='asset-title'>{row['motor_id']}</div><div class='asset-text'>Risk: {row['risk_level']} · RUL: {int(row['rul'])} · {row['maintenance_recommendation']}</div></div>",
-            unsafe_allow_html=True,
+    # Realtime Alert Detail
+    st.markdown("### Realtime Alert Detail")
+    if alert:
+        st.error(
+            f"🚨 {alert['alert_level']} | Failure Probability: {alert['failure_probability'] * 100:.2f}% | {alert['conclusion']}"
         )
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("**Trigger Reasons:**")
+        for reason in alert["trigger_reasons"]:
+            st.markdown(f"- {reason}")
+        st.markdown("**Immediate Actions:**")
+        for action in alert["immediate_actions"]:
+            st.markdown(f"- {action}")
+    else:
+        st.success("No realtime alert for this motor.")
 
-    st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-    st.markdown("<div class='section-title'>Operational Insight</div>", unsafe_allow_html=True)
-    selected_motor = st.selectbox("Select motor", frame["motor_id"].astype(str).tolist())
-    motor_view = frame[frame["motor_id"].astype(str) == selected_motor].iloc[0:1]
-    if not motor_view.empty:
-        st.json({
-            "motor_id": selected_motor,
-            "status": motor_view["status"].iloc[0],
-            "health_score": round(float(motor_view["health_score"].iloc[0]), 2),
-            "failure_probability": round(float(motor_view["failure_probability"].iloc[0]), 4),
-            "rul": int(motor_view["rul"].iloc[0]),
-            "recommendation": motor_view["maintenance_recommendation"].iloc[0],
+    # Trend Charts
+    st.markdown("### Realtime Trend")
+    history_df = get_machine_history_df(selected_machine)
+    if not history_df.empty:
+        history_df = history_df.copy()
+        history_df["timestamp"] = pd.to_datetime(history_df["timestamp"])
+        history_df["timestamp_str"] = history_df["timestamp"].dt.strftime("%H:%M:%S")
+
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.plotly_chart(
+                px.line(history_df, x="timestamp", y="temperature", title="Temperature Trend",
+                        color_discrete_sequence=["#3b82f6"]),
+                use_container_width=True,
+                key="motor_temp_trend"
+            )
+            st.plotly_chart(
+                px.line(history_df, x="timestamp", y="current", title="Current Trend",
+                        color_discrete_sequence=["#06b6d4"]),
+                use_container_width=True,
+                key="motor_current_trend"
+            )
+            st.plotly_chart(
+                px.line(history_df, x="timestamp", y="voltage", title="Voltage Trend",
+                        color_discrete_sequence=["#8b5cf6"]),
+                use_container_width=True,
+                key="motor_voltage_trend"
+            )
+        with col_right:
+            st.plotly_chart(
+                px.line(history_df, x="timestamp", y="vibration", title="Vibration Trend",
+                        color_discrete_sequence=["#ffd700"]),
+                use_container_width=True,
+                key="motor_vibration_trend"
+            )
+            st.plotly_chart(
+                px.line(history_df, x="timestamp", y="pressure", title="Pressure Trend",
+                        color_discrete_sequence=["#ff8c00"]),
+                use_container_width=True,
+                key="motor_pressure_trend"
+            )
+            st.plotly_chart(
+                px.line(history_df, x="timestamp", y="rpm", title="RPM Trend",
+                        color_discrete_sequence=["#00ff88"]),
+                use_container_width=True,
+                key="motor_rpm_trend"
+            )
+
+        # Historical Data Table
+        st.markdown("### Historical Sensor Data")
+        st.dataframe(history_df.tail(50), use_container_width=True, hide_index=True)
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+# --- PERIODIC REPORTS ---
+st.markdown('<div class="section-card">', unsafe_allow_html=True)
+st.markdown('<div class="section-title"><span class="title-accent"></span> Periodic Reports</div>', unsafe_allow_html=True)
+filtered_reports = [
+    report for report in st.session_state.periodic_reports
+    if report["machine_id"] in available_machines and report["risk_level"] in selected_risk_levels
+]
+if filtered_reports:
+    report_options = [
+        f"{r['analysis_time'].strftime('%Y-%m-%d %H:%M:%S')} | {r['machine_id']}"
+        for r in filtered_reports
+    ]
+    selected_report_label = st.selectbox("Select report", report_options, key="periodic_report_select")
+    selected_idx = report_options.index(selected_report_label)
+    chosen_report = filtered_reports[selected_idx]
+
+    rc1, rc2, rc3 = st.columns(3)
+    with rc1:
+        st.markdown("##### Output 1 - Health Summary")
+        st.json(chosen_report["output_1_health_summary"])
+    with rc2:
+        st.markdown("##### Output 2 - Failure Estimation")
+        st.json(chosen_report["output_2_failure_estimation"])
+    with rc3:
+        st.markdown("##### Output 3 - Action Plan")
+        st.json(chosen_report["output_3_action_plan"])
+else:
+    st.info("No periodic report available for the current filters.")
+st.markdown('</div>', unsafe_allow_html=True)
+
+# --- ALERT LOG ---
+st.markdown('<div class="section-card">', unsafe_allow_html=True)
+st.markdown('<div class="section-title"><span class="title-accent"></span> Alert Log</div>', unsafe_allow_html=True)
+filtered_alerts = [
+    a for a in st.session_state.alert_log
+    if a["machine_id"] in available_machines and a["alert_level"] in selected_risk_levels
+]
+if filtered_alerts:
+    alert_rows = []
+    for alert_item in filtered_alerts[:30]:
+        alert_rows.append({
+            "time": alert_item["alert_time"],
+            "machine_id": alert_item["machine_id"],
+            "level": alert_item["alert_level"],
+            "failure_probability_%": round(alert_item["failure_probability"] * 100, 2),
+            "conclusion": alert_item["conclusion"],
+            "triggers": " | ".join(alert_item["trigger_reasons"]),
         })
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.dataframe(pd.DataFrame(alert_rows), use_container_width=True, hide_index=True)
+else:
+    st.success("No alert log for the current filters.")
+st.markdown('</div>', unsafe_allow_html=True)
+
+# --- DATASET INSPECTION ---
+if show_dataset:
+    df, dataset_name = load_cleaned_dataset()
+    show_dataset_inspection(df, dataset_name)
+
+# =========================================================
+# AUTO REFRESH
+# =========================================================
+if st.session_state.running and st.session_state.auto_refresh:
+    time.sleep(st.session_state.refresh_interval)
+    st.rerun()
+

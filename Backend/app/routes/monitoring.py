@@ -22,6 +22,35 @@ from Backend.app.models.ml_model import model
 router = APIRouter()
 
 MOTOR_COUNT = 20
+_MONITORING_THREAD = None
+_MONITORING_THREAD_LOCK = threading.Lock()
+_MONITORING_STOP_EVENT = threading.Event()
+
+
+def is_monitoring_loop_running() -> bool:
+    with _MONITORING_THREAD_LOCK:
+        return _MONITORING_THREAD is not None and _MONITORING_THREAD.is_alive()
+
+
+def start_monitoring_loop():
+    global _MONITORING_THREAD
+    with _MONITORING_THREAD_LOCK:
+        if _MONITORING_THREAD is not None and _MONITORING_THREAD.is_alive():
+            return {"status": "already_running", "motors": MOTOR_COUNT}
+        _MONITORING_STOP_EVENT.clear()
+        _MONITORING_THREAD = threading.Thread(target=_sensor_loop, daemon=True, name="monitoring-sim-loop")
+        _MONITORING_THREAD.start()
+        return {"status": "started", "motors": MOTOR_COUNT}
+
+
+def stop_monitoring_loop():
+    _MONITORING_STOP_EVENT.set()
+    with _MONITORING_THREAD_LOCK:
+        thread = _MONITORING_THREAD
+        _MONITORING_THREAD = None
+    if thread is not None:
+        thread.join(timeout=2)
+    return {"status": "stopped"}
 
 
 def _build_sensor_payload(motor_id, base_time=None):
@@ -136,7 +165,7 @@ def _analyze_motor(db: Session, motor_id: int):
 
 
 def _sensor_loop():
-    while True:
+    while not _MONITORING_STOP_EVENT.is_set():
         try:
             db = next(get_db())
             for motor_id in range(1, MOTOR_COUNT + 1):
@@ -148,12 +177,9 @@ def _sensor_loop():
             time.sleep(2)
 
 
-threading.Thread(target=_sensor_loop, daemon=True).start()
-
-
 @router.post("/monitoring/simulate")
 def simulate_monitoring():
-    return {"status": "started", "motors": MOTOR_COUNT}
+    return start_monitoring_loop()
 
 
 @router.get("/dashboard-summary")
